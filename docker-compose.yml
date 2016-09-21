@@ -1,0 +1,11 @@
+redis:
+  image: redis:3-alpine
+  ports:
+    - "6379:6379"
+
+web:
+  image: nginx:1-alpine
+  volumes:
+    - "$PWD/files:/usr/share/nginx/html"
+  ports:
+    - "1220:80"
