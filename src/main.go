@@ -20,10 +20,11 @@ import (
 	"bytes"
 	"bufio"
 	"io/ioutil"
+	"time"
 )
 
 var wg sync.WaitGroup
-
+var urls chan string
 
 type Config struct{
 	domain string
@@ -36,33 +37,47 @@ func (c Config) FullPath() string {
 }
 
 func main() {
+	urls = make(chan string, 1000)
 
 	redisPool, err := pool.New("tcp", "localhost:6379", 10)
+	checkErr("Failed to connect to Redis", err)
 	cfg := Config{
 		domain:"dev-portable.pantheonsite.io",
 		proto:"http",
 		redisPool: redisPool,
 	}
 
-	//redis, _ := redisPool.Get()
-	//redis.Cmd("FLUSHALL");
-	//return
+	//conn,_ := redisPool.Get()
+	//conn.Cmd("FLUSHALL")
 
-	if err != nil {
-		// handle error
-	}
+	urls <- cfg.FullPath()
 
-	//wg.Add(2)
-	//go getPage(cfg, "http://dev-portable.pantheonsite.io/wp-content/uploads/useanyfont/160629014335gt-walsheim.woff", true)
-	//go getPage(cfg, "http://dev-portable.pantheonsite.io/wp-content/uploads/useanyfont/160629014258gt-walsheim.woff", true)
-	//wg.Wait()
-	//os.Exit(0);
-
-	for i := 200; i < 500; i++ {
+	for i := 0; i < 2; i++ {
 		wg.Add(1)
-		url := fmt.Sprintf(cfg.FullPath()+"/?p=%d", i);
-		go getPage(cfg, url, false)
+		go func() {
+			timeout := make(chan bool, 1)
+			go func() {
+				time.Sleep(360 * time.Second)
+				timeout <- true
+			}()
+			fmt.Println("URL Getter")
+			for true {
+				select {
+				case geturl := <-urls:
+				// a read from ch has occurred
+					fmt.Printf("Get: %s\n", geturl)
+					getPage(cfg, geturl, false)
+
+				case <-timeout:
+				// the read from ch has timed out
+					fmt.Printf("Timed out")
+					os.Exit(0)
+				}
+			}
+			wg.Done()
+		}()
 	}
+
 	wg.Wait()
 }
 
@@ -89,7 +104,7 @@ func getPage(cfg Config, geturl string, noCache bool) {
 			fmt.Printf("Redis(%s): %v\n", geturl, str)
 			if str == "1" {
 				fmt.Println("Cached")
-				wg.Done()
+
 				return
 			} else {
 				//fmt.Println("Redis: "+urlResp.String())
@@ -107,21 +122,17 @@ func getPage(cfg Config, geturl string, noCache bool) {
 	if err != nil {
 		defer resp.Body.Close()
 		println(resp.Status)
-		wg.Done()
 		return
 	} else {
 		if (resp.StatusCode >= 400) {
-			println(resp.Status)
-			wg.Done()
+			fmt.Printf("Failed %s: %s",resp.Status,geturl)
 			return
 		}
 
 
 		if (resp.StatusCode == 301) {
 			newUrl := resp.Header.Get("location");
-			wg.Add(1);
-			getPage(cfg, newUrl, false);
-			wg.Done()
+			urls <- newUrl
 			return
 		}
 
@@ -138,12 +149,10 @@ func getPage(cfg Config, geturl string, noCache bool) {
 		if ct == "text/css" {
 			handleCSS(cfg, geturl, resp.Body)
 			resp.Body.Close()
-			wg.Done()
 			return
 		} else if ct == "text/html; charset=UTF-8" {
 			handleHTML(cfg, geturl, resp.Body)
 			resp.Body.Close()
-			wg.Done()
 			return
 		} else {
 			of := getOutputFile(geturl)
@@ -151,19 +160,16 @@ func getPage(cfg Config, geturl string, noCache bool) {
 			io.Copy(of, resp.Body)
 
 			resp.Body.Close()
-			wg.Done()
 			return
 		}
 		resp.Body.Close()
 	}
-	wg.Done()
 }
 
 func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 	doc, err := html.Parse(body)
 	if err != nil {
 		log.Printf("Parse Err: %v\n", err)
-		wg.Done()
 		return
 	}
 	var desendants []string;
@@ -200,8 +206,7 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			setAttr(n, n.Attr, "href", updatedAttr)
 			if len(aUrl) > 0 {
 				fmt.Println("Follow Links: " + aUrl)
-				wg.Add(1)
-				go getPage(cfg, aUrl, false)
+				urls <- aUrl
 			}
 		}
 		if n.Type == html.ElementNode && n.Data == "form" {
@@ -236,8 +241,8 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 				setAttr(n, n.Attr, "href", updatedAttr)
 				if len(cssUrl) > 0 {
 					fmt.Println("Get CSS: " + cssUrl)
-					wg.Add(1)
-					go getPage(cfg, cssUrl, false)
+					urls <- cssUrl
+
 				}
 			} else {
 				_,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "href"))
@@ -249,8 +254,7 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			setAttr(n, n.Attr, "src", updatedAttr);
 			if len(imgUrl) > 0 {
 				fmt.Println("Get Img: " + imgUrl)
-				wg.Add(1)
-				go getPage(cfg, imgUrl, false)
+				urls <- imgUrl
 			}
 
 			scrset := strings.Split(getAttr(n.Attr, "srcset"), ",")
@@ -267,22 +271,17 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 				}
 				if len(imgUrl) > 0 {
 					fmt.Println("Get Img: " + imgUrl)
-					wg.Add(1)
-					go getPage(cfg, imgUrl, false)
+					urls <- imgUrl
 				}
 			}
-
 			setAttr(n, n.Attr, "srcset", strings.Join(updatedSet, ","));
-
-
 		}
 		if n.Type == html.ElementNode && n.Data == "script" {
 			scriptUrl,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "src"))
 			setAttr(n, n.Attr, "src", updatedAttr);
 			if len(scriptUrl) > 0 {
-				fmt.Println("Get Srcript: " + scriptUrl)
-				wg.Add(1)
-				go getPage(cfg, scriptUrl, false)
+				fmt.Println("Get Script: " + scriptUrl)
+				urls <- scriptUrl
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -343,40 +342,49 @@ func handleCSS(cfg Config, geturl string,body io.ReadCloser) {
 			incUrl,_ = getAbsoluteURL(cfg, geturl, incUrl)
 			if len(incUrl) > 0 {
 				fmt.Printf("URL: %s\n", incUrl);
-				wg.Add(1)
-				getPage(cfg, incUrl, false);
+				urls <- incUrl
 			}
 
 		}
 		t = s.Next()
 	}
-	fmt.Printf("Line: %d Col: %d",t.Line,t.Column)
 }
 
 func getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
 
 	rawUrl = strings.Trim(rawUrl, " ")
 
+	// empty href=""
 	if len(rawUrl) == 0 {
 		return "", "";
 	}
+	// #id urls
 	if rawUrl[0] == '#' {
 		return "", rawUrl;
 	}
-	if len(rawUrl) > 15 && rawUrl[0:15] == "javascript:void" {
+	// href="javascript:..."
+	if len(rawUrl) > 15 && rawUrl[0:11] == "javascript:" {
 		return "", rawUrl;
 	}
+	// Ignore home links = starting point
 	if len(rawUrl) == 1 && rawUrl[0] == '/' {
 		return "", rawUrl;
 	}
+	// http(s)://otherdomain
 	if (strings.Index(rawUrl, "http://") == 0 || strings.Index(rawUrl, "https://") == 0) && strings.Index(rawUrl, cfg.FullPath()) != 0 {
 		return "", strings.Replace(rawUrl, "http://", "//", 1)
 	}
+	// http://mydomain.com...
 	if strings.Index(rawUrl, cfg.FullPath()) == 0 {
 		return rawUrl,strings.Replace(rawUrl, cfg.proto+"://"+cfg.domain, "", 1)
 	}
+	// //mydomain.com...
 	if strings.Index(rawUrl, "//"+cfg.domain) == 0 {
 		return "http:" + rawUrl, strings.Replace(rawUrl, "//"+cfg.domain, "", 1)
+	}
+	// //otherdomain...
+	if rawUrl[0:2] == "//" && strings.Index(rawUrl, "//"+cfg.domain) != 0 {
+		return "", rawUrl
 	}
 	if rawUrl[0:2] != "//" && rawUrl[0] == '/' {
 		return fmt.Sprintf("%s://%s%s", cfg.proto, cfg.domain, rawUrl), rawUrl
@@ -392,13 +400,15 @@ func getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
 
 func getOutputFile(geturl string) *os.File {
 	urlBits, err := url.Parse(geturl)
-	ext := filepath.Ext(geturl)
+	ext := filepath.Ext(urlBits.Path)
 
 	var outputFile *os.File
 	var outputFilename string;
 
 	pwd, err := os.Getwd()
 	checkErr("Can't find working directory", err)
+
+	fmt.Printf("Extension: %s\n", ext)
 
 	if len(ext) > 0 {
 		outputFilename = path.Join(pwd, "files", urlBits.Path)
