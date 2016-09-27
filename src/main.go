@@ -21,64 +21,180 @@ import (
 	"bufio"
 	"io/ioutil"
 	"time"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"mime"
+	"github.com/aws/aws-sdk-go/service/cloudfront"
+	"math/rand"
+	"strconv"
 )
 
 var wg sync.WaitGroup
 var urls chan string
+var invalidate chan string
 
 type Config struct{
-	domain string
-	proto string
+	domain,newDomain,proto,bucket,s3region string
 	redisPool *pool.Pool
+	extraUrls []string
+	bucketList map[string]int64
+	runId int64
 }
 
 func (c Config) FullPath() string {
 	return fmt.Sprintf("%s://%s", c.proto, c.domain)
 }
 
+
 func main() {
+	http.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Fetching: %s<br>\n", "dev-portable.pantheonsite.io");
+		fetch()
+		fmt.Fprintln(w, "Done");
+	});
+	http.HandleFunc("/clear-cache", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Clearing cache");
+		redisPool, err := pool.New("tcp", "localhost:6379", 10)
+		if err != nil {
+			fmt.Fprintln(w, "Redis Error");
+			return;
+		}
+		conn, _ := redisPool.Get()
+		resp := conn.Cmd("FLUSHALL")
+		if resp.Err != nil {
+			fmt.Fprintln(w, "Redis Error");
+			return;
+		}
+		fmt.Fprintln(w, "Done");
+	});
+	fmt.Println("Listening on 8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
+}
+
+func fetch() {
 	urls = make(chan string, 1000)
+	invalidate = make(chan string, 100000)
 
 	redisPool, err := pool.New("tcp", "localhost:6379", 10)
 	checkErr("Failed to connect to Redis", err)
 	cfg := Config{
 		domain:"dev-portable.pantheonsite.io",
+		newDomain:"portable.com.au",
+		bucket:"portable.com.au",
+		s3region:  "ap-southeast-2",
 		proto:"http",
 		redisPool: redisPool,
+		runId: time.Now().Unix(),
+		extraUrls: []string{
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/elegant-icons/fonts/ElegantIcons.woff",
+			"http://dev-portable.pantheonsite.io/wp-content/uploads/useanyfont/160629015139copernicus-book.woff",
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/font-awesome/fonts/fontawesome-webfont.woff2?v=4.5.0",
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/font-awesome/fonts/fontawesome-webfont.woff?v=4.5.0",
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/font-awesome/fonts/fontawesome-webfont.ttf?v=4.5.0",
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/elegant-icons/fonts/ElegantIcons.ttf",
+			"http://dev-portable.pantheonsite.io/wp-content/themes/bridge/css/elegant-icons/fonts/ElegantIcons.ttf",
+			"http://dev-portable.pantheonsite.io/wp-content/uploads/useanyfont/160629015413gt-walsheim-bold-ttf.woff",
+			"http://dev-portable.pantheonsite.io/wp-includes/js/wp-emoji-release.min.js?ver=4.6.1",
+			"http://dev-portable.pantheonsite.io/wp-content/uploads/2016/06/00c38cBigGreen.png?id=958",
+			"http://dev-portable.pantheonsite.io/wp-content/uploads/2016/06/00c38c-slide.png",
+		},
 	}
-
-	//conn,_ := redisPool.Get()
-	//conn.Cmd("FLUSHALL")
+	cfg.bucketList = make(map[string]int64, 100000)
+	svc := s3.New(session.New(), &aws.Config{Region: aws.String(cfg.s3region)})
+	err = svc.ListObjectsPages(&s3.ListObjectsInput{Bucket:&cfg.bucket},
+		func(objs *s3.ListObjectsOutput, lastPage bool) bool {
+			for _, obj := range objs.Contents {
+				cfg.bucketList[*obj.Key] = *obj.Size
+			}
+			return true
+		})
+	checkErr("List Error", err)
 
 	urls <- cfg.FullPath()
+	for _, extra := range cfg.extraUrls {
+		urls <- extra
+	}
 
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func() {
 			timeout := make(chan bool, 1)
 			go func() {
-				time.Sleep(360 * time.Second)
+				time.Sleep(60 * time.Second)
 				timeout <- true
 			}()
-			fmt.Println("URL Getter")
+//			fmt.Println("URL Getter")
 			for true {
 				select {
 				case geturl := <-urls:
 				// a read from ch has occurred
-					fmt.Printf("Get: %s\n", geturl)
+					//fmt.Printf("Get: %s\n", geturl)
 					getPage(cfg, geturl, false)
 
 				case <-timeout:
 				// the read from ch has timed out
-					fmt.Printf("Timed out")
-					os.Exit(0)
+					fmt.Println("Timed out")
+					invalidateCloudfront()
+					wg.Done()
+					break;
 				}
 			}
-			wg.Done()
 		}()
 	}
-
 	wg.Wait()
+}
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func RandStringBytesRmndr(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[rand.Int63() % int64(len(letterBytes))]
+	}
+	return string(b)
+}
+
+func invalidateCloudfront() {
+	invalidSet := make([]*string, 0)
+	//close(invalidate)
+	for inv := range invalidate {
+		fmt.Printf("Inv: %s\n", inv)
+		invalidSet = append(invalidSet, aws.String(inv))
+	}
+
+	cfSvc := cloudfront.New(session.New())
+
+	total := int64(len(invalidSet))
+
+	fmt.Printf("Invalidate: %v\n", invalidSet)
+
+	_,err := cfSvc.CreateInvalidation(&cloudfront.CreateInvalidationInput{
+		DistributionId: aws.String("E3U5ZY3M99CJ9M"), // Required
+		InvalidationBatch: &cloudfront.InvalidationBatch{ // Required
+			CallerReference: aws.String(RandStringBytesRmndr(15)), // Required
+			Paths: &cloudfront.Paths{ // Required
+				Quantity: aws.Int64(total), // Required
+				Items: invalidSet,
+			},
+		},
+	})
+	checkErr("CloudFront Error", err)
+}
+
+
+func putS3(bucketName, key, filename string) {
+	fmt.Printf("Upload: %s\n", filename)
+	data,_ := ioutil.ReadFile(filename)
+	ext := path.Ext(filename)
+	client := s3.New(session.New(), &aws.Config{Region: aws.String("ap-southeast-2")})
+	_,err := client.PutObject(&s3.PutObjectInput{
+		Bucket:             aws.String(bucketName), // Required
+		Key:                aws.String(key), // Required
+		Body:               bytes.NewReader(data),
+		ContentType:        aws.String(mime.TypeByExtension(ext)),
+	})
+	checkErr(fmt.Sprintf("Failed Put (%s)", filename), err)
+	wg.Done()
 }
 
 func checkErr(msg string, e error) {
@@ -92,7 +208,29 @@ type parentChild struct {
 	child  *html.Node
 }
 
+func addUrlToQueue(cfg Config, newUrl string) {
+	redis, _ := cfg.redisPool.Get()
+	urlResp := redis.Cmd("GET", "added_"+newUrl)
+	if urlResp.Err != nil {
+		fmt.Println("Redis Error")
+	} else {
+		str, _ := urlResp.Str()
+		if str == strconv.FormatInt(cfg.runId, 10) {
+			//fmt.Println("In Queue")
+			return
+		}
+	}
+	urls <- newUrl
+	redis.Cmd("SET", "added_"+newUrl, strconv.FormatInt(cfg.runId, 10))
+}
+
 func getPage(cfg Config, geturl string, noCache bool) {
+
+	urlBits,_ := url.Parse(geturl)
+	ext := path.Ext(urlBits.Path)
+	if ext == ".html" || len(ext) == 0 {
+		noCache = true;
+	}
 
 	if noCache != true {
 		redis, _ := cfg.redisPool.Get()
@@ -101,10 +239,8 @@ func getPage(cfg Config, geturl string, noCache bool) {
 			fmt.Println("Redis Error")
 		} else {
 			str, _ := urlResp.Str()
-			fmt.Printf("Redis(%s): %v\n", geturl, str)
 			if str == "1" {
-				fmt.Println("Cached")
-
+//				fmt.Println("Cached")
 				return
 			} else {
 				//fmt.Println("Redis: "+urlResp.String())
@@ -125,14 +261,14 @@ func getPage(cfg Config, geturl string, noCache bool) {
 		return
 	} else {
 		if (resp.StatusCode >= 400) {
-			fmt.Printf("Failed %s: %s",resp.Status,geturl)
+			fmt.Printf("Failed %s: %s\n",resp.Status,geturl)
 			return
 		}
 
 
 		if (resp.StatusCode == 301) {
 			newUrl := resp.Header.Get("location");
-			urls <- newUrl
+			addUrlToQueue(cfg, newUrl)
 			return
 		}
 
@@ -144,22 +280,23 @@ func getPage(cfg Config, geturl string, noCache bool) {
 
 		ct := resp.Header.Get("Content-Type")
 
-
-
-		if ct == "text/css" {
+		if ct[0:8] == "text/css" {
 			handleCSS(cfg, geturl, resp.Body)
 			resp.Body.Close()
 			return
-		} else if ct == "text/html; charset=UTF-8" {
+		} else if ct[0:9] == "text/html" {
 			handleHTML(cfg, geturl, resp.Body)
 			resp.Body.Close()
 			return
 		} else {
-			of := getOutputFile(geturl)
+			of := getOutputFile(geturl, "")
 
 			io.Copy(of, resp.Body)
 
 			resp.Body.Close()
+
+			replaceString(cfg, of)
+
 			return
 		}
 		resp.Body.Close()
@@ -205,8 +342,8 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			aUrl,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "href"))
 			setAttr(n, n.Attr, "href", updatedAttr)
 			if len(aUrl) > 0 {
-				fmt.Println("Follow Links: " + aUrl)
-				urls <- aUrl
+				//fmt.Println("Follow Links: " + aUrl)
+				addUrlToQueue(cfg, aUrl)
 			}
 		}
 		if n.Type == html.ElementNode && n.Data == "form" {
@@ -214,7 +351,7 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			setAttr(n, n.Attr, "action", updatedAttr)
 		}
 		if n.Type == html.ElementNode && n.Data == "meta" {
-			fmt.Printf("Meta: %s\n", getAttr(n.Attr, "name"));
+			//fmt.Printf("Meta: %s\n", getAttr(n.Attr, "name"));
 			if inArray(getAttr(n.Attr, "name"), dropMeta) {
 				cleanUp = append(cleanUp, parentChild{
 					parent:n.Parent,
@@ -223,7 +360,7 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			}
 		}
 		if n.Type == html.ElementNode && n.Data == "link" {
-			fmt.Printf("Link Rel: %s\n", getAttr(n.Attr, "rel"));
+			//fmt.Printf("Link Rel: %s\n", getAttr(n.Attr, "rel"));
 			if inArray(getAttr(n.Attr, "rel"), dropLinks) {
 				cleanUp = append(cleanUp, parentChild{
 					parent:n.Parent,
@@ -238,10 +375,13 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			}
 			if "stylesheet" == getAttr(n.Attr, "rel") {
 				cssUrl,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "href"))
+				if cssUrl != "" {
+					updatedAttr = addExt(updatedAttr, ".css")
+				}
 				setAttr(n, n.Attr, "href", updatedAttr)
 				if len(cssUrl) > 0 {
-					fmt.Println("Get CSS: " + cssUrl)
-					urls <- cssUrl
+					//fmt.Println("Get CSS: " + cssUrl)
+					addUrlToQueue(cfg, cssUrl)
 
 				}
 			} else {
@@ -253,8 +393,8 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			imgUrl,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "src"))
 			setAttr(n, n.Attr, "src", updatedAttr);
 			if len(imgUrl) > 0 {
-				fmt.Println("Get Img: " + imgUrl)
-				urls <- imgUrl
+				//fmt.Println("Get Img: " + imgUrl)
+				addUrlToQueue(cfg, imgUrl)
 			}
 
 			scrset := strings.Split(getAttr(n.Attr, "srcset"), ",")
@@ -270,8 +410,8 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 					updatedSet = append(updatedSet, updatedAttr)
 				}
 				if len(imgUrl) > 0 {
-					fmt.Println("Get Img: " + imgUrl)
-					urls <- imgUrl
+					//fmt.Println("Get Img: " + imgUrl)
+					addUrlToQueue(cfg, imgUrl)
 				}
 			}
 			setAttr(n, n.Attr, "srcset", strings.Join(updatedSet, ","));
@@ -280,8 +420,8 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 			scriptUrl,updatedAttr := getAbsoluteURL(cfg, geturl, getAttr(n.Attr, "src"))
 			setAttr(n, n.Attr, "src", updatedAttr);
 			if len(scriptUrl) > 0 {
-				fmt.Println("Get Script: " + scriptUrl)
-				urls <- scriptUrl
+				//fmt.Println("Get Script: " + scriptUrl)
+				addUrlToQueue(cfg, scriptUrl)
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -295,7 +435,7 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 		a.parent.RemoveChild(a.child)
 	}
 
-	outputFile := getOutputFile(geturl)
+	outputFile := getOutputFile(geturl, "")
 	defer outputFile.Close()
 
 	var buf bytes.Buffer
@@ -308,10 +448,21 @@ func handleHTML(cfg Config, geturl string, body io.ReadCloser) {
 
 	m := &minify.M{}
 	htmlMin.Minify(m, outputFile, bufR,  map[string]string{"inline":"1"})
+
+	replaceString(cfg, outputFile)
+
+}
+
+func addExt(fn, reqExt string) string  {
+	ext := filepath.Ext(fn)
+	if ext != reqExt {
+		fn = fn+reqExt
+	}
+	return fn
 }
 
 func handleCSS(cfg Config, geturl string,body io.ReadCloser) {
-	outputFile := getOutputFile(geturl)
+	outputFile := getOutputFile(geturl, ".css")
 
 	m := &minify.M{}
 	css.Minify(m, outputFile, body, map[string]string{"inline":"0"})
@@ -342,21 +493,66 @@ func handleCSS(cfg Config, geturl string,body io.ReadCloser) {
 			incUrl,_ = getAbsoluteURL(cfg, geturl, incUrl)
 			if len(incUrl) > 0 {
 				fmt.Printf("URL: %s\n", incUrl);
-				urls <- incUrl
+				addUrlToQueue(cfg, incUrl)
 			}
 
 		}
 		t = s.Next()
 	}
+
+	replaceString(cfg, outputFile)
+
+}
+
+func replaceString(cfg Config, f *os.File) {
+	file,_ := ioutil.ReadFile(f.Name())
+	content := string(file)
+	content = strings.Replace(content, cfg.FullPath()+"/", "/", -1)
+	content = strings.Replace(content, cfg.proto+":\\/\\/"+cfg.domain+"\\/", "\\/", -1)
+
+	stat,_ := os.Stat(f.Name())
+
+	ioutil.WriteFile(f.Name(), []byte(content), stat.Mode())
+
+	pwd,_ := os.Getwd()
+	key := f.Name()[len(path.Join(pwd,"files"))+1:]
+
+	if val, ok := cfg.bucketList[key]; ok {
+		if (stat.Size() == val || stat.Size()+1 == val) {
+			// Same Size
+		} else {
+			wg.Add(1)
+			invalidate <- "/"+key
+			go putS3(cfg.bucket, key, f.Name());
+		}
+	} else {
+		wg.Add(1)
+		go putS3(cfg.bucket, key, f.Name());
+	}
+
 }
 
 func getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
+	newUrl, replace := _getAbsoluteURL(cfg, currentUrl, rawUrl)
+
+	if newUrl != "" {
+		u,_ := url.Parse(replace)
+		return newUrl, u.Path
+	}
+
+	return newUrl, replace;
+}
+func _getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
 
 	rawUrl = strings.Trim(rawUrl, " ")
 
 	// empty href=""
 	if len(rawUrl) == 0 {
 		return "", "";
+	}
+	// #mailto:
+	if len(rawUrl) >6 && rawUrl[0:7] == "mailto:" {
+		return "", rawUrl;
 	}
 	// #id urls
 	if rawUrl[0] == '#' {
@@ -386,10 +582,12 @@ func getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
 	if rawUrl[0:2] == "//" && strings.Index(rawUrl, "//"+cfg.domain) != 0 {
 		return "", rawUrl
 	}
+	// /base/path
 	if rawUrl[0:2] != "//" && rawUrl[0] == '/' {
 		return fmt.Sprintf("%s://%s%s", cfg.proto, cfg.domain, rawUrl), rawUrl
 	}
 
+	// relative/path
 	u,_ := url.Parse(currentUrl)
 	pathBits := strings.Split(u.Path, "/")
 	pathDir := strings.Join(pathBits[0:len(pathBits)-1], "/")
@@ -398,9 +596,15 @@ func getAbsoluteURL(cfg Config, currentUrl, rawUrl string) (string,string) {
 	return  newUrl, rawUrl
 }
 
-func getOutputFile(geturl string) *os.File {
+func getOutputFile(geturl string, reqExt string) *os.File {
 	urlBits, err := url.Parse(geturl)
+
+	if len(reqExt) > 0 {
+		urlBits.Path = addExt(urlBits.Path, reqExt)
+	}
+
 	ext := filepath.Ext(urlBits.Path)
+
 
 	var outputFile *os.File
 	var outputFilename string;
@@ -408,7 +612,7 @@ func getOutputFile(geturl string) *os.File {
 	pwd, err := os.Getwd()
 	checkErr("Can't find working directory", err)
 
-	fmt.Printf("Extension: %s\n", ext)
+	//fmt.Printf("Extension: %s\n", ext)
 
 	if len(ext) > 0 {
 		outputFilename = path.Join(pwd, "files", urlBits.Path)
