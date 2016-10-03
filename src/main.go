@@ -181,7 +181,18 @@ func putS3(bucketName, key, filename string) {
 	checkErr(fmt.Sprintf("Failed Put (%s)", filename), err)
 	wg.Done()
 }
-
+func putS3Redirect(bucketName, key, redirect string) {
+	fmt.Printf("PUT Redirect: %s\n", redirect)
+	client := s3.New(session.New(), &aws.Config{Region: aws.String("ap-southeast-2")})
+	_,err := client.PutObject(&s3.PutObjectInput{
+		Bucket:             aws.String(bucketName), // Required
+		Key:                aws.String(key), // Required
+		Body:               strings.NewReader(""),
+		ContentType:        aws.String("text/html"),
+		WebsiteRedirectLocation: aws.String(redirect),
+	})
+	checkErr(fmt.Sprintf("Failed Put (%s)", key), err)
+}
 func checkErr(msg string, e error) {
 	if e != nil {
 		fmt.Printf("Error %s: %v", msg, e)
@@ -253,6 +264,11 @@ func getPage(cfg Config, geturl string, noCache bool) {
 
 		if (resp.StatusCode == 301) {
 			newUrl := resp.Header.Get("location");
+
+			urlBits,_ := url.Parse(geturl);
+			newUrlBits,_ := url.Parse(newUrl);
+			putS3Redirect(cfg.bucket, urlBits.Path+"/index.html", newUrlBits.Path)
+
 			addUrlToQueue(cfg, newUrl)
 			return
 		}
