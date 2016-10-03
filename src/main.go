@@ -98,6 +98,7 @@ func fetch() {
 			"http://dev-portable.pantheonsite.io/wp-includes/js/wp-emoji-release.min.js?ver=4.6.1",
 			"http://dev-portable.pantheonsite.io/wp-content/uploads/2016/06/00c38cBigGreen.png?id=958",
 			"http://dev-portable.pantheonsite.io/wp-content/uploads/2016/06/00c38c-slide.png",
+			"http://dev-portable.pantheonsite.io/companies-weve-transformed/grace-papers",
 		},
 	}
 	cfg.bucketList = make(map[string]int64, 100000)
@@ -119,26 +120,10 @@ func fetch() {
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func() {
-			timeout := make(chan bool, 1)
-			go func() {
-				time.Sleep(60 * time.Second)
-				timeout <- true
-			}()
-//			fmt.Println("URL Getter")
-			for true {
-				select {
-				case geturl := <-urls:
+			for geturl := range urls {
 				// a read from ch has occurred
-					//fmt.Printf("Get: %s\n", geturl)
-					getPage(cfg, geturl, false)
-
-				case <-timeout:
-				// the read from ch has timed out
-					fmt.Println("Timed out")
-					invalidateCloudfront()
-					wg.Done()
-					break;
-				}
+				//fmt.Printf("Get: %s\n", geturl)
+				getPage(cfg, geturl, false)
 			}
 		}()
 	}
